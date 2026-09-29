@@ -1,18 +1,31 @@
+import os
+
 import pandas as pd
-import psycopg2
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
+
+
+# --------------------------------------------------
+# Load environment variables
+# --------------------------------------------------
+
+load_dotenv()
 
 
 # --------------------------------------------------
 # PostgreSQL connection
 # --------------------------------------------------
 
-conn = psycopg2.connect(
-    host="localhost",
-    port=5432,
-    database="ecommerce_db",
-    user="postgres",
-    password="PASSWORD"
+DATABASE_URL = (
+    f"postgresql+psycopg2://"
+    f"{os.getenv('DB_USER')}:"
+    f"{os.getenv('DB_PASSWORD')}@"
+    f"{os.getenv('DB_HOST')}:"
+    f"{os.getenv('DB_PORT')}/"
+    f"{os.getenv('DB_NAME')}"
 )
+
+engine = create_engine(DATABASE_URL)
 
 
 # --------------------------------------------------
@@ -25,7 +38,10 @@ FROM dw.etl_control
 WHERE pipeline_name = 'customers';
 """
 
-control_df = pd.read_sql(control_query, conn)
+control_df = pd.read_sql(
+    control_query,
+    engine
+)
 
 last_run = control_df.iloc[0]["last_run_timestamp"]
 
@@ -47,16 +63,15 @@ SELECT
     country,
     created_at
 FROM customers
-WHERE created_at > %s
+WHERE created_at > %(last_run)s
 ORDER BY created_at;
 """
 
 customers = pd.read_sql(
     query,
-    conn,
-    params=(last_run,)
+    engine,
+    params={"last_run": last_run}
 )
-
 
 print(f"New customers extracted: {len(customers)}")
 
@@ -75,4 +90,8 @@ customers.to_csv(
 print(f"Incremental data saved to: {OUTPUT_FILE}")
 
 
-conn.close()
+# --------------------------------------------------
+# Close SQLAlchemy engine
+# --------------------------------------------------
+
+engine.dispose()

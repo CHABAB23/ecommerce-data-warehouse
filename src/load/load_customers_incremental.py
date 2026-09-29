@@ -1,17 +1,36 @@
-import pandas as pd
-import psycopg2
+import os
 
+import pandas as pd
+from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
+
+
+# --------------------------------------------------
+# Load environment variables
+# --------------------------------------------------
+
+load_dotenv()
+
+
+# --------------------------------------------------
+# Input file
+# --------------------------------------------------
 
 INPUT_FILE = "data/raw/customers_incremental.csv"
 
 
 # --------------------------------------------------
-# 1. Read incremental data
+# Read incremental data
 # --------------------------------------------------
 
 customers = pd.read_csv(INPUT_FILE)
 
 print(f"Incremental rows: {len(customers)}")
+
+
+# --------------------------------------------------
+# Stop if there are no new customers
+# --------------------------------------------------
 
 if customers.empty:
     print("No new customers to load.")
@@ -19,7 +38,7 @@ if customers.empty:
 
 
 # --------------------------------------------------
-# 2. Find the newest source timestamp
+# Prepare timestamp
 # --------------------------------------------------
 
 customers["created_at"] = pd.to_datetime(
@@ -33,113 +52,115 @@ print(f"New watermark: {max_created_at}")
 
 
 # --------------------------------------------------
-# 3. PostgreSQL connection
+# PostgreSQL connection
 # --------------------------------------------------
 
-conn = psycopg2.connect(
-    host="localhost",
-    port=5432,
-    database="ecommerce_db",
-    user="postgres",
-    password="PASSWORD"
+DATABASE_URL = (
+    f"postgresql+psycopg2://"
+    f"{os.getenv('DB_USER')}:"
+    f"{os.getenv('DB_PASSWORD')}@"
+    f"{os.getenv('DB_HOST')}:"
+    f"{os.getenv('DB_PORT')}/"
+    f"{os.getenv('DB_NAME')}"
 )
 
-cursor = conn.cursor()
+engine = create_engine(DATABASE_URL)
 
+
+# --------------------------------------------------
+# Load customers into warehouse
+# --------------------------------------------------
+
+inserted = 0
+skipped = 0
 
 try:
 
-    inserted = 0
-    skipped = 0
+    with engine.begin() as connection:
 
-    # --------------------------------------------------
-    # 4. Load customers into dim_customer
-    # --------------------------------------------------
+        for _, row in customers.iterrows():
 
-    for _, row in customers.iterrows():
-
-        cursor.execute(
-            """
-            SELECT 1
-            FROM dw.dim_customer
-            WHERE customer_id = %s;
-            """,
-            (int(row["customer_id"]),)
-        )
-
-        exists = cursor.fetchone()
-
-        if exists:
-            skipped += 1
-            continue
-
-        cursor.execute(
-            """
-            INSERT INTO dw.dim_customer (
-                customer_id,
-                first_name,
-                last_name,
-                email,
-                phone,
-                city,
-                country,
-                created_at
+            # Check whether customer already exists
+            result = connection.execute(
+                text("""
+                    SELECT 1
+                    FROM dw.dim_customer
+                    WHERE customer_id = :customer_id;
+                """),
+                {
+                    "customer_id": int(row["customer_id"])
+                }
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
-            """,
-            (
-                int(row["customer_id"]),
-                row["first_name"],
-                row["last_name"],
-                row["email"],
-                row["phone"],
-                row["city"],
-                row["country"],
-                row["created_at"].to_pydatetime()
+
+            exists = result.fetchone()
+
+            if exists:
+                skipped += 1
+                continue
+
+            # Insert new customer
+            connection.execute(
+                text("""
+                    INSERT INTO dw.dim_customer (
+                        customer_id,
+                        first_name,
+                        last_name,
+                        email,
+                        phone,
+                        city,
+                        country,
+                        created_at
+                    )
+                    VALUES (
+                        :customer_id,
+                        :first_name,
+                        :last_name,
+                        :email,
+                        :phone,
+                        :city,
+                        :country,
+                        :created_at
+                    );
+                """),
+                {
+                    "customer_id": int(row["customer_id"]),
+                    "first_name": row["first_name"],
+                    "last_name": row["last_name"],
+                    "email": row["email"],
+                    "phone": row["phone"],
+                    "city": row["city"],
+                    "country": row["country"],
+                    "created_at": row["created_at"].to_pydatetime()
+                }
             )
+
+            inserted += 1
+
+        # Update ETL watermark
+        connection.execute(
+            text("""
+                UPDATE dw.etl_control
+                SET last_run_timestamp = :last_run_timestamp
+                WHERE pipeline_name = 'customers';
+            """),
+            {
+                "last_run_timestamp": max_created_at.to_pydatetime()
+            }
         )
-
-        inserted += 1
-
-    # --------------------------------------------------
-    # 5. Update ETL control
-    # --------------------------------------------------
-
-    cursor.execute(
-        """
-        UPDATE dw.etl_control
-        SET last_run_timestamp = %s
-        WHERE pipeline_name = 'customers';
-        """,
-        (max_created_at.to_pydatetime(),)
-    )
-
-    # --------------------------------------------------
-    # 6. Commit everything together
-    # --------------------------------------------------
-
-    conn.commit()
 
     print(f"Customers inserted: {inserted}")
     print(f"Customers skipped: {skipped}")
     print("ETL control updated.")
     print("Transaction committed successfully.")
 
+
 except Exception as e:
 
-    # --------------------------------------------------
-    # 7. Rollback everything if something fails
-    # --------------------------------------------------
-
-    conn.rollback()
-
-    print("ETL transaction failed.")
     print(f"Error: {e}")
     print("Transaction rolled back.")
-
     raise
+
 
 finally:
 
-    cursor.close()
-    conn.close()
+    engine.dispose()
